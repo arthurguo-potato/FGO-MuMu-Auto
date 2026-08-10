@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Local runtime state
+profiles/user.yaml
+runs/
+logs/
+*.log
+
+# Build output
+.build/
+dist/
+vendor/wheels/*.whl
+
+# Screenshots and local calibration output
+current-screen.png
+match-result.png
+codex_fgo_probe.png
+battle-probe-*.png
+*-probe.png
+*-match-result.png
+next-flow-*.png
+quest-start-*.png
+story-skip-*.png
+skip-confirm-*.png
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
