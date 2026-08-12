@@ -1631,11 +1631,42 @@ class BotRunner:
             height=recovered.height,
         )
 
+    def _battle_attack_retry_match(
+        self,
+        screen: np.ndarray,
+        rule: dict[str, Any],
+    ) -> MatchResult | None:
+        """Confirm that Attack is still visible with a retry-safe threshold."""
+        relaxed = dict(rule)
+        configured = float(
+            self.config.get("battle", {}).get(
+                "attack_retry_match_threshold",
+                0.65,
+            )
+        )
+        relaxed["threshold"] = min(
+            float(rule.get("threshold", 0.86)),
+            configured,
+        )
+        return self.matcher.match_rule(screen, relaxed)
+
     def _support_rule_enabled(self, name: str) -> bool:
         return bool(
             self.config.get("support", {})
             .get("strategy_options", {})
             .get(name, True)
+        )
+
+    @staticmethod
+    def _rule_allows_repeat(rule: dict[str, Any], action: str) -> bool:
+        # Attack is safe to revisit: _execute first checks whether the command
+        # card screen is already open, so it will not click the Back button at
+        # the same lower-right coordinate. If the battle screen truly stayed
+        # unchanged, running the action again gives an ignored tap another
+        # chance instead of letting the generic stuck-screen guard pause it.
+        return bool(rule.get("allow_repeat", False)) or (
+            str(rule.get("name", "")) == "battle_attack"
+            and action == "battle"
         )
 
     def _reset_support_class_search(
@@ -2536,6 +2567,106 @@ class BotRunner:
                 f"内部 {previous} → 游戏 {self.battle_turn}"
             )
 
+    def _tap_first_three_cards(self, card_screen: np.ndarray) -> None:
+        """Tap the configured first three face cards without visual analysis."""
+        battle = self.config.get("battle", {})
+        labels = list(
+            battle.get("default_cards", ["card1", "card2", "card3"])
+        )[:3]
+        if len(labels) != 3:
+            self._pause("默认选卡配置必须包含三张卡", card_screen)
+        points = battle.get("card_points", {})
+        self._pending_np_slots.clear()
+        self.log(f"简化选卡：固定选择 {' → '.join(labels)}")
+        for label in labels:
+            if label not in points:
+                self._pause(f"战斗配置没有卡位 {label}", card_screen)
+            self._tap(
+                self._scaled_point(points[label], card_screen),
+                f"指令卡 {label}",
+            )
+            self._wait_interruptibly(
+                float(battle.get("between_cards_seconds", 0.35))
+            )
+
+    def _simple_first_three_battle_action(
+        self,
+        screen: np.ndarray,
+        match: MatchResult,
+    ) -> None:
+        """Open the command-card screen and select its first three cards."""
+        battle = self.config.get("battle", {})
+        resume_card_screen = str(match.rule.get("name", "")) == "command_cards"
+        command_rule = next(
+            (
+                rule
+                for rule in self.config.get("rules", [])
+                if rule.get("name") == "command_cards"
+            ),
+            None,
+        )
+        if command_rule is None:
+            self._pause("缺少 command_cards 识别规则", screen, match)
+
+        card_screen: np.ndarray | None = screen if resume_card_screen else None
+        if not resume_card_screen:
+            attack_attempts = max(
+                1,
+                int(battle.get("attack_tap_attempts", 6)),
+            )
+            probe_attempts = max(
+                1,
+                int(battle.get("card_screen_attempts", 8)),
+            )
+            for attack_attempt in range(1, attack_attempts + 1):
+                self._tap(
+                    match.center,
+                    f"Attack {attack_attempt}/{attack_attempts}",
+                )
+                self._wait_interruptibly(
+                    float(battle.get("card_wait_seconds", 1.4))
+                )
+                if self.stop_event.is_set():
+                    return
+                attack_still_visible = False
+                for probe in range(1, probe_attempts + 1):
+                    current = self.device.capture()
+                    if self.matcher.match_rule(current, command_rule) is not None:
+                        card_screen = current
+                        break
+                    retry_match = self._battle_attack_retry_match(
+                        current,
+                        match.rule,
+                    )
+                    if retry_match is not None:
+                        match = retry_match
+                        attack_still_visible = True
+                        self.log(
+                            "Attack 点击未生效，按钮仍在；"
+                            f"准备重试 {attack_attempt}/{attack_attempts}"
+                        )
+                        break
+                    self.log(
+                        f"等待指令卡页出现 {probe}/{probe_attempts}"
+                    )
+                    self._wait_interruptibly(
+                        float(battle.get("card_screen_retry_seconds", 0.8))
+                    )
+                if card_screen is not None:
+                    break
+                if attack_still_visible:
+                    self._wait_interruptibly(
+                        float(battle.get("attack_retry_seconds", 1.0))
+                    )
+            if card_screen is None:
+                self._pause(
+                    f"连续点击 Attack {attack_attempts} 次仍未进入指令卡页",
+                    self.device.capture(),
+                    match,
+                )
+
+        self._tap_first_three_cards(card_screen)
+
     def _battle_action(
         self,
         screen: np.ndarray,
@@ -2571,6 +2702,12 @@ class BotRunner:
             )
 
         self.log(f"简单战斗：第 {self.battle_turn} 回合")
+        if str(battle.get("card_selection_mode", "first_three")).lower() in {
+            "first_three",
+            "first3",
+        }:
+            self._simple_first_three_battle_action(screen, match)
+            return
         if not resume_card_screen:
             initial_context = self._battle_skill_context(screen)
             should_pause_for_missing_primary = (
@@ -2843,7 +2980,7 @@ class BotRunner:
         card_screen: np.ndarray | None = None
         cards_info = None
         attempts = int(battle.get("card_screen_attempts", 5))
-        attack_attempts = int(battle.get("attack_tap_attempts", 3))
+        attack_attempts = max(1, int(battle.get("attack_tap_attempts", 6)))
         command_rule = next(
             (
                 rule
@@ -2904,6 +3041,17 @@ class BotRunner:
                         and self.matcher.match_rule(card_screen, command_rule)
                         is None
                     ):
+                        retry_match = self._battle_attack_retry_match(
+                            card_screen,
+                            match.rule,
+                        )
+                        if retry_match is not None:
+                            match = retry_match
+                            self.log(
+                                "Attack 点击后按钮仍在，判定本次点击未生效；"
+                                f"准备再次点击 {attack_attempt}/{attack_attempts}"
+                            )
+                            break
                         self.log(
                             f"等待指令卡页完整出现 {attempt}/{attempts}"
                         )
@@ -2935,11 +3083,19 @@ class BotRunner:
                         )
                 if cards_info is not None:
                     break
-                if (
-                    card_screen is None
-                    or self.matcher.match_rule(card_screen, match.rule) is None
-                ):
+                if card_screen is None:
                     break
+                retry_match = self._battle_attack_retry_match(
+                    card_screen,
+                    match.rule,
+                )
+                if retry_match is None:
+                    # Attack has disappeared, so a blind tap at the same
+                    # lower-right coordinate could hit the card-screen Back
+                    # button. Keep the final error path for this ambiguous
+                    # state instead of issuing an unsafe click.
+                    break
+                match = retry_match
                 self.log(
                     f"Attack 未生效，准备重试 "
                     f"{attack_attempt}/{attack_attempts}"
@@ -3642,6 +3798,24 @@ class BotRunner:
     ) -> None:
         settings = self.config.get("support", {})
         options = settings.get("strategy_options", {})
+        selection_mode = str(options.get("selection_mode", "first")).lower()
+        if selection_mode == "first":
+            # The support screen always opens at the top of the list.  Select
+            # the first visible row directly so character, level, NP and guest
+            # markers cannot prevent the quest from continuing.
+            point = self._scaled_point(
+                settings.get(
+                    "first_support_click_point",
+                    settings.get("forced_support_click_point", [750, 350]),
+                ),
+                screen,
+            )
+            self.selected_support = None
+            self.support_refreshes = 0
+            self._reset_support_class_search()
+            self.log("助战选择：直接选择列表第一位（包括客将）")
+            self._tap(point, "列表第一位助战")
+            return
         if self._select_guest_only_berserker_page_if_confirmed(
             screen,
             match,
@@ -4732,7 +4906,7 @@ class BotRunner:
                 screen,
                 match,
             )
-        allow_repeat = bool(rule.get("allow_repeat", False))
+        allow_repeat = self._rule_allows_repeat(rule, action)
         if action == "story" and self.config["behavior"].get("story_mode") == "advance":
             allow_repeat = True
         if not allow_repeat:
