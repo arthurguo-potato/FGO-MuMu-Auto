@@ -1502,7 +1502,9 @@ rules:
   allow_repeat: true
 - name: support_screen
   template: templates/support_screen.png
-  threshold: 0.72
+  # 1920x1080 下标题边缘匹配通常约为 0.69；客将规则会优先命中，
+  # 普通好友列表必须依靠此标题规则识别，因此保留少量缩放余量。
+  threshold: 0.68
   match_mode: edge
   canny_lower: 80
   canny_upper: 160
